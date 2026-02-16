@@ -10,35 +10,76 @@ const stream = require('stream');
 
 const pipeline = promisify(stream.pipeline);
 
-// Инициализация бота и Gemini
+// ================= ИНИЦИАЛИЗАЦИЯ =================
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-// Вспомогательная функция: скачать файл из Telegram
-async function downloadFile(fileId, fileExt) {
-  try {
-    const fileLink = await bot.telegram.getFileLink(fileId);
-    const url = fileLink.href;
-    const tempDir = os.tmpdir();
-    const filePath = path.join(tempDir, `${fileId}.${fileExt}`);
-    const writer = createWriteStream(filePath);
-    const response = await axios({ url, method: 'GET', responseType: 'stream' });
-    await pipeline(response.data, writer);
-    return filePath;
-  } catch (error) {
-    console.error('Ошибка скачивания файла:', error);
-    throw error;
-  }
+// Проверка ключа Gemini
+if (!process.env.GEMINI_API_KEY) {
+  console.error('❌ GEMINI_API_KEY не найден в переменных окружения');
+} else {
+  console.log('✅ GEMINI_API_KEY загружен');
 }
 
-// Вспомогательная функция: прочитать файл и закодировать в base64
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Пробуем разные модели (на случай, если одна недоступна)
+const models = [
+  "gemini-1.5-flash",
+  "gemini-1.5-pro",
+  "gemini-pro"
+];
+
+let model = null;
+let modelIndex = 0;
+
+// ================= ФУНКЦИИ =================
+async function downloadFile(fileId, fileExt) {
+  const fileLink = await bot.telegram.getFileLink(fileId);
+  const url = fileLink.href;
+  const tempDir = os.tmpdir();
+  const filePath = path.join(tempDir, `${fileId}.${fileExt}`);
+  const writer = createWriteStream(filePath);
+  const response = await axios({ url, method: 'GET', responseType: 'stream' });
+  await pipeline(response.data, writer);
+  return filePath;
+}
+
 function fileToBase64(filePath) {
   const data = fs.readFileSync(filePath);
   return data.toString('base64');
 }
 
-// КОМАНДА /start
+// Функция для отправки в Gemini с выбором модели
+async function askGemini(prompt, parts = []) {
+  let lastError = null;
+
+  for (let i = modelIndex; i < models.length; i++) {
+    try {
+      console.log(`🔄 Пробуем модель: ${models[i]}`);
+      const currentModel = genAI.getGenerativeModel({ model: models[i] });
+      
+      let result;
+      if (parts.length > 0) {
+        result = await currentModel.generateContent([prompt, ...parts]);
+      } else {
+        result = await currentModel.generateContent(prompt);
+      }
+      
+      // Если успешно — запоминаем рабочую модель
+      modelIndex = i;
+      console.log(`✅ Модель ${models[i]} работает`);
+      return result.response.text();
+    } catch (error) {
+      console.log(`❌ Модель ${models[i]} не работает:`, error.message);
+      lastError = error;
+      // Пробуем следующую
+    }
+  }
+
+  throw lastError || new Error('Все модели Gemini недоступны');
+}
+
+// ================= ОБРАБОТЧИКИ =================
 bot.start((ctx) => {
   ctx.reply(
     '👋 Добро пожаловать! Я – ваш виртуальный терапевт на базе Gemini.\n' +
@@ -54,121 +95,43 @@ bot.start((ctx) => {
   );
 });
 
-// Обработка текстовых сообщений
 bot.on('text', async (ctx) => {
   const userText = ctx.message.text;
 
-  // Если нажали кнопку
   if (userText === 'Получить консультацию') {
     ctx.reply('Опишите ваши симптомы, задайте вопрос или загрузите анализ (фото, документ, голос).');
     return;
   }
 
   try {
-    // Отправляем текст в Gemini
-    const result = await model.generateContent(userText);
-    const response = result.response.text();
+    // Проверка ключа
+    if (!process.env.GEMINI_API_KEY) {
+      return ctx.reply('❌ Ошибка: API ключ Gemini не найден на сервере');
+    }
+
+    await ctx.reply('⏳ Думаю...');
+
+    const response = await askGemini(userText);
     ctx.reply(response);
+    
   } catch (error) {
-    console.error('Ошибка Gemini:', error);
-    ctx.reply('❌ Ошибка при обращении к AI. Пожалуйста, попробуйте позже.');
+    console.error('❌ Ошибка Gemini:', error);
+    
+    let errorMessage = '❌ Ошибка при обращении к AI.';
+    
+    if (error.message?.includes('API key')) {
+      errorMessage = '❌ Неверный API ключ Gemini. Проверьте настройки.';
+    } else if (error.message?.includes('quota')) {
+      errorMessage = '❌ Превышен лимит запросов к Gemini. Попробуйте позже.';
+    } else if (error.message?.includes('models')) {
+      errorMessage = '❌ Модели Gemini временно недоступны. Попробуйте позже.';
+    }
+    
+    ctx.reply(errorMessage);
   }
 });
 
-// Обработка ФОТОГРАФИЙ
-bot.on('photo', async (ctx) => {
-  try {
-    const photo = ctx.message.photo.pop();
-    const fileId = photo.file_id;
-    
-    await ctx.reply('📸 Получил фото, обрабатываю...');
-    
-    const filePath = await downloadFile(fileId, 'jpg');
-    const base64Image = fileToBase64(filePath);
-
-    const prompt = "Ты – опытный врач-терапевт. Расшифруй этот медицинский анализ или опиши, что видно на изображении. Если это не медицинское изображение, просто сообщи, что на нём изображено.";
-    const imagePart = {
-      inlineData: {
-        data: base64Image,
-        mimeType: "image/jpeg"
-      }
-    };
-
-    const result = await model.generateContent([prompt, imagePart]);
-    const response = result.response.text();
-    
-    await ctx.reply(response);
-    fs.unlinkSync(filePath); // Удаляем временный файл
-  } catch (error) {
-    console.error('Ошибка обработки фото:', error);
-    ctx.reply('❌ Не удалось обработать изображение. Пожалуйста, попробуйте ещё раз.');
-  }
-});
-
-// Обработка ДОКУМЕНТОВ
-bot.on('document', async (ctx) => {
-  try {
-    const doc = ctx.message.document;
-    const fileId = doc.file_id;
-    const mimeType = doc.mime_type;
-    const fileName = doc.file_name;
-    const fileExt = fileName.split('.').pop() || 'bin';
-    
-    await ctx.reply('📄 Получил документ, обрабатываю...');
-
-    const filePath = await downloadFile(fileId, fileExt);
-    const base64File = fileToBase64(filePath);
-
-    const prompt = "Ты – врач. Проанализируй содержимое этого файла. Если это медицинский анализ – дай интерпретацию. Если это просто текст – ответь по существу.";
-    const filePart = {
-      inlineData: {
-        data: base64File,
-        mimeType: mimeType || "application/octet-stream"
-      }
-    };
-
-    const result = await model.generateContent([prompt, filePart]);
-    const response = result.response.text();
-    
-    await ctx.reply(response);
-    fs.unlinkSync(filePath);
-  } catch (error) {
-    console.error('Ошибка обработки документа:', error);
-    ctx.reply('❌ Ошибка при обработке документа.');
-  }
-});
-
-// Обработка ГОЛОСОВЫХ СООБЩЕНИЙ
-bot.on('voice', async (ctx) => {
-  try {
-    const voice = ctx.message.voice;
-    const fileId = voice.file_id;
-    
-    await ctx.reply('🎤 Получил голосовое, обрабатываю...');
-
-    const filePath = await downloadFile(fileId, 'ogg');
-    const base64Audio = fileToBase64(filePath);
-
-    const prompt = "Прослушай это голосовое сообщение и кратко перескажи, о чём оно. Если это медицинский вопрос – ответь как врач.";
-    const audioPart = {
-      inlineData: {
-        data: base64Audio,
-        mimeType: "audio/ogg"
-      }
-    };
-
-    const result = await model.generateContent([prompt, audioPart]);
-    const response = result.response.text();
-    
-    await ctx.reply(response);
-    fs.unlinkSync(filePath);
-  } catch (error) {
-    console.error('Ошибка обработки голоса:', error);
-    ctx.reply('❌ Ошибка при обработке голосового сообщения.');
-  }
-});
-
-// Экспорт для Vercel
+// ================= ЭКСПОРТ =================
 module.exports = async (req, res) => {
   try {
     await bot.handleUpdate(req.body, res);
